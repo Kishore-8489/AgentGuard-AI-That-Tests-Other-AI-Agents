@@ -1,0 +1,79 @@
+name: AgentGuard CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agentguard-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Python checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - name: Install package and tools
+        run: python -m pip install -e './backend[dev]'
+      - name: Static checks
+        run: python -m compileall -q backend/app && ruff check backend/app backend/tests
+      - name: Unit and integration tests
+        working-directory: backend
+        run: pytest -q
+
+  frontend:
+    name: React build and TypeScript
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --no-audit --no-fund
+      - run: npm run build
+
+  e2e:
+    name: Browser smoke test
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install -e ./backend
+      - run: npm install --no-audit --no-fund
+        working-directory: frontend
+      - run: npx playwright install --with-deps chromium
+        working-directory: frontend
+      - name: Start SQLite-backed eager demo API
+        run: |
+          cd backend
+          DEMO_MODE=true AGENTGUARD_EAGER=true DATABASE_URL=sqlite:///./e2e.db \
+            nohup uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/agentguard-api.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/health && break
+            sleep 1
+          done
+          curl -f http://127.0.0.1:8000/health
+      - run: npm run test:e2e
+        working-directory: frontend
+      - name: Log API errors
+        if: failure()
+        run: cat /tmp/agentguard-api.log || true
